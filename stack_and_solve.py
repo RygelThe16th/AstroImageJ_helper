@@ -324,7 +324,9 @@ def solve_group(group, group_dir, args):
     スタックしてsolve-fieldにかける。
     (解けたWCSヘッダー(astropy Header)またはNone, 所要秒数,
      groupと同じ順番のシフト量[(dy,dx),...]またはNone,
-     同じ順番の信頼度[bool,...]またはNone)を返す。
+     同じ順番の信頼度[bool,...]またはNone,
+     solve-fieldのsubprocess.CompletedProcess(標準出力・エラー出力を
+     含む。失敗時の診断に使う))を返す。
      信頼度がFalseのフレームは、シフト量自体は(なめらかさを仮定した
      推定値で)埋まっているが、実際の相関では大きく外れていたフレームで
      あることを示す。呼び出し側は、そのようなフレームには個別のWCSを
@@ -348,13 +350,13 @@ def solve_group(group, group_dir, args):
     stacked = sigma_clipped_stack(data_cube, sigma=args.sigma)
     write_stack_fits(stack_path, stacked, header)
 
-    _, elapsed = run_solve_field(
+    proc, elapsed = run_solve_field(
         stack_path, group_dir, args.scale_low, args.scale_high,
         args.scale_units, args.backend_config, args.tweak_order,
         args.extra_solve_field_arg)
 
     wcs_header = load_solved_wcs_header(group_dir, 'stack')
-    return wcs_header, elapsed, shifts, reliable
+    return wcs_header, elapsed, shifts, reliable, proc
 
 
 def main():
@@ -422,6 +424,21 @@ def main():
                           'WCS無しでそのまま出力ディレクトリにコピーする。'
                           'デフォルトでは書き出さない(出力ディレクトリには'
                           '解決できたフレームだけが残る)。')
+    ap.add_argument('--verbose-solve', action='store_true',
+                     help='solve-field自身の標準出力を、試行のたびに'
+                          '全部表示する(デバッグ用)。デフォルトでは'
+                          '最終的に失敗が確定したグループについてのみ、'
+                          '末尾数行だけを表示する。')
+    ap.add_argument('--unreliable-list-out', default=None,
+                     help='位置合わせの信頼度が低いと判定されたフレームの'
+                          'ファイル名一覧を書き出すテキストファイルのパス'
+                          '(1行1ファイル名。tbl_to_csv.rbの'
+                          '--exclude-frame-fileにそのまま渡せる形式)。'
+                          '未指定なら書き出さない。低信頼度は必ずしも'
+                          '測光失敗を意味しないので、これはあくまで'
+                          '「光度曲線に外れ値が出たとき最初に疑うための'
+                          'チェックリスト」であり、機械的に全部除外する'
+                          'ための道具ではない。')
     args = ap.parse_args()
     max_group_size = args.max_group_size or args.group_size * 4
 
@@ -462,8 +479,16 @@ def main():
         label, group = queue.popleft()
         attempt_seq += 1
         group_dir = os.path.join(work_dir_root, f'group_{label}')
-        wcs_header, elapsed, shifts, reliable = solve_group(group, group_dir, args)
+        wcs_header, elapsed, shifts, reliable, proc = solve_group(
+            group, group_dir, args)
         names = [os.path.basename(p) for p in group]
+
+        if args.verbose_solve:
+            print(f"  --- solve-field stdout (group {label}) ---")
+            print(proc.stdout)
+            if proc.stderr:
+                print(f"  --- solve-field stderr (group {label}) ---")
+                print(proc.stderr)
 
         if wcs_header is not None:
             n_ok += 1
@@ -503,6 +528,13 @@ def main():
         print(f"[group {label}] 解決失敗 ({elapsed:.2f}秒, {len(group)}枚: "
               f"{names[0]} 〜 {names[-1]}) → これ以上合体できないため断念",
               file=sys.stderr)
+        if not args.verbose_solve:
+            tail_lines = [ln for ln in proc.stdout.splitlines() if ln.strip()][-6:]
+            if tail_lines:
+                print("  solve-fieldの出力(末尾数行、詳細は--verbose-solve):",
+                      file=sys.stderr)
+                for ln in tail_lines:
+                    print(f"    {ln}", file=sys.stderr)
         if args.write_unsolved:
             for p in group:
                 dst = os.path.join(args.output_dir, os.path.basename(p))
@@ -518,7 +550,20 @@ def main():
         for name in unreliable_frame_names:
             print(f"  {name}")
         print("→ これらのフレームは他より測光精度が落ちている可能性があります。"
-              "光度曲線で明らかに外れた点が出たら、まずこの一覧を疑ってください。")
+              "光度曲線で明らかに外れた点が出たら、まずこの一覧を疑ってください。"
+              "機械的に全部除外すべきという意味ではない(測光自体は無事な"
+              "ことも多い)。")
+        if args.unreliable_list_out:
+            with open(args.unreliable_list_out, 'w', encoding='utf-8') as f:
+                f.write('# stack_and_solve.pyが位置合わせの信頼度が低いと\n'
+                        '# 判定したフレーム一覧。tbl_to_csv.rbの\n'
+                        '# --exclude-frame-fileにそのまま渡せる。\n'
+                        '# ただし低信頼度=測光失敗とは限らないので、\n'
+                        '# 光度曲線を見て実際に外れ値になっている場合のみ\n'
+                        '# 使うことを推奨(機械的な一律除外はしないこと)。\n')
+                for name in unreliable_frame_names:
+                    f.write(name + '\n')
+            print(f"→ 一覧を書き出しました: {args.unreliable_list_out}")
     if failed_groups:
         skip_note = "(出力ディレクトリには書き出していません)" if not args.write_unsolved \
             else "(WCS無しでコピー済み)"
